@@ -1,0 +1,45 @@
+# Build the ingress image with the GStreamer version pinned in .gst-version:
+#   GSTVERSION=$(cat ../../.gst-version) docker compose build
+# run-bench.sh exports GSTVERSION itself when it is unset.
+services:
+  redis:
+    image: redis:7-alpine
+
+  livekit:
+    image: livekit/livekit-server
+    command: ["--dev", "--config", "/etc/livekit.yaml", "--node-ip", "127.0.0.1"]
+    volumes:
+      - ./livekit.yaml:/etc/livekit.yaml:ro
+    depends_on:
+      - redis
+    ports:
+      - "7880:7880"
+      - "7881:7881"
+      - "50000-50100:50000-50100/udp"
+
+  ingress:
+    image: lk-ingress-gpu-bench
+    build:
+      context: ../..
+      dockerfile: build/ingress/Dockerfile
+      args:
+        GSTVERSION: ${GSTVERSION:-}
+    environment:
+      INGRESS_CONFIG_FILE: /etc/ingress.yaml
+      NVIDIA_DRIVER_CAPABILITIES: compute,video,utility
+    volumes:
+      - ./ingress.yaml:/etc/ingress.yaml:ro
+    depends_on:
+      - redis
+      - livekit
+    ports:
+      - "1935:1935"
+      - "8080:8080"
+      - "9090:9090"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
