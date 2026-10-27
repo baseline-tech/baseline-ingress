@@ -117,17 +117,23 @@ H.264 transcoding can run on NVIDIA GPUs through GStreamer's `nvcodec` plugin. I
 ```yaml
 gpu:
   enabled: true
-  # concurrent GPU transcoding sessions this node accepts
-  max_sessions: 8
+  # NVENC encoder sessions this node holds at once. A stream takes one per simulcast layer,
+  # so the default 3-layer request takes three.
+  max_encoder_sessions: 8
   # CPU cost reserved per GPU session, instead of the full rtmp/url cpu cost
   cpu_cost: 0.5
+  # nvh264enc preset, p1 (fastest) to p7 (best quality)
+  preset: p3
 ```
 
-- Only `H264_BASELINE` transcoding sessions (RTMP, URL, and WHIP with transcoding) use the GPU. VP8 and WHIP bypass sessions stay on the CPU and do not count against `max_sessions`.
-- Frames are uploaded once, converted and scaled with `cudaconvert`/`cudaconvertscale`, and encoded with `nvh264enc` (constant bitrate, low latency, no B-frames).
-- At startup the service checks that `cudaupload`, `cudaconvert`, `cudaconvertscale` and `nvh264enc` are available. If any is missing it logs `gpu transcoding unavailable, using the cpu` and runs every session on the CPU.
-- Requirements: an NVIDIA GPU with NVENC, a container started with the NVIDIA container toolkit (`--gpus all`, `NVIDIA_DRIVER_CAPABILITIES=compute,video,utility`), and the CUDA NVRTC library (`libnvrtc`) in the image, which `cudaconvert` needs and the stock image does not ship.
-- `gpu` is read at startup and is not hot reloaded. `max_sessions` also bounds the sessions the encoder hardware can sustain, so tune it per GPU.
+- Only `H264_BASELINE` transcoding sessions (RTMP, URL, and WHIP with transcoding) use the GPU. VP8 and WHIP bypass sessions stay on the CPU and hold no encoder sessions.
+- Two GPU tiers exist. `nvidia` uploads frames once and converts, scales and encodes on the GPU (`cudaupload`, `cudaconvert`, `cudaconvertscale`, `nvh264enc`). `nvidia-encode` converts and scales on the CPU (`videoconvert`, `videoscale`) and only encodes with `nvh264enc`; it is what runs when NVRTC, which the CUDA converters compile their kernels with, is missing. The encoder runs constant bitrate, low latency, no B-frames, with the configured `preset`.
+- At startup the service smoke encodes a few test frames through each tier, `nvidia` first, and keeps the first that reaches EOS. It logs `gpu tier failed its smoke encode` with the reason for each tier it skipped, then `gpu transcoding enabled` with the tier, or `gpu transcoding unavailable, using the cpu` when none works, in which case every session runs on the CPU. The resolved tier is passed to the handlers.
+- Each handler repeats the smoke encode with as many encoder sessions as the stream has layers before it builds its pipeline. A tier that fails there logs `falling back` and the whole stream is built on the next tier, down to the CPU. Nothing is rebuilt mid-stream. Each `video layer` log line names the `backend` used.
+- Admission counts NVENC encoder sessions. A GPU-eligible session is admitted on the GPU when its layers fit in `max_encoder_sessions` and `cpu_cost` CPU is free; otherwise it is admitted on the CPU at the normal rtmp/url/whip cost, logged as `gpu encoder sessions exhausted, transcoding on the cpu`, and the handler is told to use the CPU. The node stays available as long as either the GPU or the CPU has room. The `livekit_ingress_gpu_encoder_sessions` gauge reports the sessions held.
+- GeForce cards cap concurrent NVENC sessions in the driver (8 on current drivers, 3 or 5 on older ones), which is the default `max_encoder_sessions`. Datacenter cards (T4, L4, A10 and similar) have no cap, so raise it to what the card sustains. The `scripts/gpu-bench` kit measures that.
+- Requirements: an NVIDIA GPU with NVENC, a container started with the NVIDIA container toolkit (`--gpus all`, `NVIDIA_DRIVER_CAPABILITIES=compute,video,utility`). The image built from `build/ingress/Dockerfile` installs the CUDA NVRTC library (`cuda-nvrtc-12-8`) the `nvidia` tier needs.
+- `gpu` is read at startup and is not hot reloaded.
 
 In order for the LiveKit server to be able to create Ingress sessions, an `ingress` section must also be added to the livekit-server configuration:
 
