@@ -17,7 +17,6 @@ package media
 import (
 	"testing"
 
-	"github.com/go-gst/go-gst/gst"
 	"github.com/stretchr/testify/require"
 
 	"github.com/livekit/ingress/pkg/config"
@@ -27,15 +26,22 @@ func TestProbeGPUDisabledIsANoop(t *testing.T) {
 	gpu := config.GPUConfig{}
 	ProbeGPU(&gpu)
 	require.False(t, gpu.Enabled)
+	require.Empty(t, gpu.Tier, "a disabled gpu writes no tier into the handler config")
 }
 
 func TestProbeGPUFallsBackWithoutNvcodec(t *testing.T) {
-	gst.Init(nil)
-	if gst.Find("nvh264enc") != nil {
-		t.Skip("nvcodec is available")
-	}
+	requireNoNvidiaEncoder(t)
 
-	gpu := config.GPUConfig{Enabled: true, MaxSessions: 1, CPUCost: 1}
+	gpu := config.GPUConfig{Enabled: true, MaxEncoderSessions: 1, CPUCost: 1, Preset: "p3", Tier: config.GPUTierNvidia}
 	ProbeGPU(&gpu)
 	require.False(t, gpu.Enabled)
+}
+
+func TestProbeGPURecordsTheTier(t *testing.T) {
+	requireNvidiaEncoder(t)
+
+	gpu := config.GPUConfig{Enabled: true, MaxEncoderSessions: 1, CPUCost: 1, Preset: "p3", Tier: config.GPUTierNvidia}
+	ProbeGPU(&gpu)
+	require.True(t, gpu.Enabled)
+	require.True(t, gpu.Tier.UsesGPU(), "the probe records a gpu tier for handlers")
 }

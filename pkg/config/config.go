@@ -16,6 +16,8 @@ package config
 
 import (
 	"os"
+	"slices"
+	"strings"
 
 	"github.com/sirupsen/logrus"
 	"gopkg.in/yaml.v3"
@@ -39,9 +41,40 @@ const (
 	DefaultWHIPPort      = 8080
 	DefaultHTTPRelayPort = 9090
 
-	DefaultGPUMaxSessions = 8
-	DefaultGPUCPUCost     = 0.5
+	// NVENC encoder sessions per node. Consumer GeForce cards cap concurrent NVENC sessions
+	// (8 on current drivers, 3 or 5 on older ones), datacenter cards do not.
+	DefaultGPUMaxEncoderSessions = 8
+	DefaultGPUCPUCost            = 0.5
+	DefaultGPUPreset             = "p3"
 )
+
+// GPUTier is a video transcoding chain. Tiers order from the most GPU work to none.
+type GPUTier string
+
+const (
+	// GPUTierNvidia uploads frames once and converts, scales and encodes on the GPU.
+	GPUTierNvidia GPUTier = "nvidia"
+	// GPUTierNvidiaEncode converts and scales on the CPU and encodes with NVENC.
+	// It is the tier for images or drivers without NVRTC, which the CUDA converters need.
+	GPUTierNvidiaEncode GPUTier = "nvidia-encode"
+	GPUTierCPU          GPUTier = "cpu"
+)
+
+// UsesGPU returns true if the tier holds NVENC encoder sessions.
+func (t GPUTier) UsesGPU() bool {
+	return t == GPUTierNvidia || t == GPUTierNvidiaEncode
+}
+
+// Next returns the tier a session falls back to when this one fails.
+func (t GPUTier) Next() GPUTier {
+	if t == GPUTierNvidia {
+		return GPUTierNvidiaEncode
+	}
+	return GPUTierCPU
+}
+
+// GPUPresets are the nvh264enc presets from fastest to slowest.
+var GPUPresets = []string{"p1", "p2", "p3", "p4", "p5", "p6", "p7"}
 
 var (
 	DefaultICEPortRange = []uint16{2000, 4000}
@@ -118,27 +151,41 @@ type CPUCostConfig struct {
 
 type GPUConfig struct {
 	Enabled bool `yaml:"enabled"`
-	// Concurrent GPU transcoded sessions per node. Each one holds an NVENC session per simulcast layer,
-	// which some GPUs cap.
-	MaxSessions int `yaml:"max_sessions"`
+	// NVENC encoder sessions the node admits at once. A stream holds one per simulcast layer.
+	MaxEncoderSessions int `yaml:"max_encoder_sessions"`
 	// CPU cores reserved per GPU session for demuxing, audio and relaying
 	CPUCost float64 `yaml:"cpu_cost"`
+	// nvh264enc preset, p1 (fastest) to p7 (slowest)
+	Preset string `yaml:"preset"`
+	// Tier is resolved by the service's startup probe, not set by hand. A handler reads it from
+	// the config the service hands it, set to cpu when the session spilled over to the CPU.
+	Tier GPUTier `yaml:"tier,omitempty"`
 }
 
 // Encodes returns true if the GPU encodes the video codec. VP8 has no NVENC support.
 func (g GPUConfig) Encodes(codec livekit.VideoCodec) bool {
-	return g.Enabled && codec == livekit.VideoCodec_H264_BASELINE
+	return g.Enabled && g.Tier.UsesGPU() && codec == livekit.VideoCodec_H264_BASELINE
 }
 
-func (g *GPUConfig) setDefaults() {
-	if g.MaxSessions <= 0 {
-		g.MaxSessions = DefaultGPUMaxSessions
-		logger.Infow("gpu max_sessions not set, using default", "maxSessions", g.MaxSessions)
+func (g *GPUConfig) initDefaults() error {
+	if g.MaxEncoderSessions <= 0 {
+		g.MaxEncoderSessions = DefaultGPUMaxEncoderSessions
+		logger.Infow("gpu max_encoder_sessions not set, using default", "maxEncoderSessions", g.MaxEncoderSessions)
 	}
 	if g.CPUCost <= 0 {
 		g.CPUCost = DefaultGPUCPUCost
 		logger.Infow("gpu cpu_cost not set, using default", "cpuCost", g.CPUCost)
 	}
+	if g.Preset == "" {
+		g.Preset = DefaultGPUPreset
+	}
+	if !slices.Contains(GPUPresets, g.Preset) {
+		return psrpc.NewErrorf(psrpc.InvalidArgument, "gpu preset %q is not one of %s", g.Preset, strings.Join(GPUPresets, ", "))
+	}
+	if g.Tier == "" {
+		g.Tier = GPUTierNvidia
+	}
+	return nil
 }
 
 func NewConfig(confString string) (*Config, error) {
@@ -182,7 +229,9 @@ func (c *ServiceConfig) InitDefaults() error {
 		c.WHIPPort = DefaultWHIPPort
 	}
 	if c.GPU.Enabled {
-		c.GPU.setDefaults()
+		if err := c.GPU.initDefaults(); err != nil {
+			return err
+		}
 	}
 
 	err := c.InitWhipConf()

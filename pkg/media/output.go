@@ -99,7 +99,7 @@ func NewVideoOutput(backend *videoBackend, codec livekit.VideoCodec, layer *live
 
 	threadCount := getVideoEncoderThreadCount(layer)
 
-	e.logger.Infow("video layer", "backend", backend.name, "width", layer.Width, "height", layer.Height, "threads", threadCount)
+	e.logger.Infow("video layer", "backend", backend.tier, "width", layer.Width, "height", layer.Height, "threads", threadCount)
 
 	queueIn, err := gst.NewElementWithName("queue", fmt.Sprintf("video_%s_in", layer.Quality.String()))
 	if err != nil {
@@ -142,7 +142,7 @@ func NewVideoOutput(backend *videoBackend, codec livekit.VideoCodec, layer *live
 
 	switch codec {
 	case livekit.VideoCodec_H264_BASELINE:
-		e.enc, err = backend.newH264Encoder(layer, threadCount)
+		e.enc, err = backend.h264Encoder(layer, threadCount)
 		if err != nil {
 			return nil, err
 		}

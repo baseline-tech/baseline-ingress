@@ -170,10 +170,11 @@ cpu_cost:
   url_cpu_cost: 0.0001
 gpu:
   enabled: true
-  max_sessions: 2
+  max_encoder_sessions: 2
   cpu_cost: 0.0001
 `)
 	require.NoError(t, err)
+	conf.GPU.Tier = config.GPUTierNvidia
 
 	m := NewMonitor()
 	require.NoError(t, m.Start(conf))
@@ -197,7 +198,7 @@ gpu:
 	require.Eventually(t, m.CanAccept, 5*time.Second, 50*time.Millisecond, "the cpu sampler reports idle time")
 	require.True(t, m.AcceptIngress(first))
 	require.True(t, m.AcceptIngress(second))
-	require.False(t, m.AcceptIngress(rtmp()), "a third session does not fit in max_sessions")
+	require.False(t, m.AcceptIngress(rtmp()), "a third session does not fit in max_encoder_sessions")
 	require.False(t, m.CanAccept(), "a node without a free gpu session is not available")
 
 	m.IngressStarted(first)
@@ -231,7 +232,7 @@ cpu_cost:
   min_idle_ratio: 0.01
   rtmp_cpu_cost: 0.0001
 gpu:
-  max_sessions: 1
+  max_encoder_sessions: 1
 `)
 	require.NoError(t, err)
 

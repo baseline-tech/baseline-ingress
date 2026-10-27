@@ -363,7 +363,7 @@ func (m *Monitor) CanAccept() bool {
 	defer m.costConfigLock.Unlock()
 
 	if m.gpuConfig.Enabled {
-		return m.gpuSessions.Load()+m.pendingGPU.Load() < int32(m.gpuConfig.MaxSessions) &&
+		return m.gpuSessions.Load()+m.pendingGPU.Load() < int32(m.gpuConfig.MaxEncoderSessions) &&
 			m.getAvailable(m.cpuCostConfig.MinIdleRatio) > m.gpuConfig.CPUCost
 	}
 
@@ -421,7 +421,7 @@ func (m *Monitor) canAcceptIngress(info *livekit.IngressInfo, alreadyCommitted b
 	}
 
 	if gpu = m.usesGPU(info); gpu {
-		accept = m.gpuSessions.Load()+m.pendingGPU.Load() < int32(m.gpuConfig.MaxSessions) && available > m.gpuConfig.CPUCost
+		accept = m.gpuSessions.Load()+m.pendingGPU.Load() < int32(m.gpuConfig.MaxEncoderSessions) && available > m.gpuConfig.CPUCost
 		cpuHold = m.gpuConfig.CPUCost
 	}
 

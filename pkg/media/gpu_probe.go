@@ -21,7 +21,8 @@ import (
 	"github.com/livekit/protocol/logger"
 )
 
-// ProbeGPU turns gpu.enabled off when the nvcodec elements are not registered, so sessions fall back to the CPU.
+// ProbeGPU smoke encodes a few frames through each GPU tier, records the best working tier in gpu
+// so handlers inherit it, and turns gpu.enabled off when none works so sessions use the CPU.
 func ProbeGPU(gpu *config.GPUConfig) {
 	if !gpu.Enabled {
 		return
@@ -29,17 +30,20 @@ func ProbeGPU(gpu *config.GPUConfig) {
 
 	gst.Init(nil)
 
-	var missing []string
-	for _, name := range nvidiaElementFactories {
-		if gst.Find(name) == nil {
-			missing = append(missing, name)
-		}
+	first := gpu.Tier
+	if !first.UsesGPU() {
+		first = config.GPUTierNvidia
 	}
-	if len(missing) > 0 {
-		logger.Warnw("gpu transcoding unavailable, using the cpu", nil, "missingElements", missing)
+	tier, failures := resolveVideoTier(*gpu, first, 1)
+	for _, f := range failures {
+		logger.Warnw("gpu tier failed its smoke encode", f.err, "tier", f.tier)
+	}
+	if !tier.UsesGPU() {
+		logger.Warnw("gpu transcoding unavailable, using the cpu", nil)
 		gpu.Enabled = false
 		return
 	}
 
-	logger.Infow("gpu transcoding enabled", "maxSessions", gpu.MaxSessions, "cpuCost", gpu.CPUCost)
+	gpu.Tier = tier
+	logger.Infow("gpu transcoding enabled", "tier", tier, "maxEncoderSessions", gpu.MaxEncoderSessions, "cpuCost", gpu.CPUCost, "preset", gpu.Preset)
 }

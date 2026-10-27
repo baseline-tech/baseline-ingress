@@ -184,11 +184,9 @@ func (s *WebRTCSink) isPlayingTooSlow() bool {
 	return false
 }
 
-func (s *WebRTCSink) addVideoTrack(backend *videoBackend, w, h int) ([]*Output, error) {
+func (s *WebRTCSink) addVideoTrack(backend *videoBackend, sortedLayers []*livekit.VideoLayer) ([]*Output, error) {
 	outputs := make([]*Output, 0)
 	sbArray := make([]lksdk_output.SampleProvider, 0)
-
-	sortedLayers := filterAndSortLayersByQuality(s.params.VideoEncodingOptions.Layers, w, h)
 
 	for _, layer := range sortedLayers {
 		output, err := NewVideoOutput(backend, s.params.VideoEncodingOptions.VideoCodec, layer, s.outputSync.AddTrack(), s.isPlayingTooSlow, s.statsGatherer, s.eos)
@@ -267,9 +265,10 @@ func (s *WebRTCSink) AddTrack(kind types.StreamKind, caps *gst.Caps) (*gst.Bin, 
 
 		logger.Infow("source resolution parsed", "width", w, "height", h)
 
-		backend := selectVideoBackend(s.params.GPU, s.params.VideoEncodingOptions.VideoCodec)
+		sortedLayers := filterAndSortLayersByQuality(s.params.VideoEncodingOptions.Layers, w, h)
+		backend := selectVideoBackend(s.params.GPU, s.params.VideoEncodingOptions.VideoCodec, len(sortedLayers))
 
-		outputs, err := s.addVideoTrack(backend, w, h)
+		outputs, err := s.addVideoTrack(backend, sortedLayers)
 		if err != nil {
 			logger.Errorw("could not add video track", err)
 			return nil, err

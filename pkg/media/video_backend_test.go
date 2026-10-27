@@ -26,13 +26,53 @@ import (
 	"github.com/livekit/protocol/livekit"
 )
 
-func TestSelectVideoBackend(t *testing.T) {
-	gpu := config.GPUConfig{Enabled: true}
+func TestSelectVideoBackendWithoutGPU(t *testing.T) {
+	gst.Init(nil)
 
-	require.Same(t, nvidiaVideoBackend, selectVideoBackend(gpu, livekit.VideoCodec_H264_BASELINE))
-	require.Same(t, cpuVideoBackend, selectVideoBackend(gpu, livekit.VideoCodec_VP8))
-	require.Same(t, cpuVideoBackend, selectVideoBackend(config.GPUConfig{}, livekit.VideoCodec_H264_BASELINE))
-	require.Same(t, cpuVideoBackend, selectVideoBackend(config.GPUConfig{}, livekit.VideoCodec_VP8))
+	require.Same(t, cpuVideoBackend, selectVideoBackend(config.GPUConfig{}, livekit.VideoCodec_H264_BASELINE, 3))
+	require.Same(t, cpuVideoBackend, selectVideoBackend(config.GPUConfig{}, livekit.VideoCodec_VP8, 3))
+	require.Same(t, cpuVideoBackend, selectVideoBackend(config.GPUConfig{Enabled: true, Tier: config.GPUTierCPU}, livekit.VideoCodec_H264_BASELINE, 3), "a session spilled over to the cpu")
+	require.Same(t, cpuVideoBackend, selectVideoBackend(config.GPUConfig{Enabled: true, Tier: config.GPUTierNvidia}, livekit.VideoCodec_VP8, 3))
+}
+
+func TestSelectVideoBackendFallsBackWithoutNvcodec(t *testing.T) {
+	requireNoNvidiaEncoder(t)
+
+	gpu := config.GPUConfig{Enabled: true, Preset: "p3", Tier: config.GPUTierNvidia}
+	require.Equal(t, config.GPUTierCPU, selectVideoBackend(gpu, livekit.VideoCodec_H264_BASELINE, 3).tier)
+
+	tier, failures := resolveVideoTier(gpu, config.GPUTierNvidia, 3)
+	require.Equal(t, config.GPUTierCPU, tier)
+	require.Len(t, failures, 2, "both gpu tiers are tried before the cpu")
+	require.Equal(t, config.GPUTierNvidia, failures[0].tier)
+	require.Equal(t, config.GPUTierNvidiaEncode, failures[1].tier)
+	for _, f := range failures {
+		t.Logf("%s: %v", f.tier, f.err)
+	}
+}
+
+func TestCPUSmokeEncode(t *testing.T) {
+	gst.Init(nil)
+
+	require.NoError(t, cpuVideoBackend.smokeEncode(3), "the smoke harness encodes with three concurrent x264 sessions")
+}
+
+func TestSmokeEncodeReportsPipelineErrors(t *testing.T) {
+	gst.Init(nil)
+
+	broken := *cpuVideoBackend
+	broken.converters = []elementSpec{{factory: "capsfilter", caps: "video/x-raw,format=NV12"}}
+	broken.rawCaps = "video/x-raw,format=I420"
+	require.Error(t, broken.smokeEncode(1), "a chain that cannot negotiate fails the smoke instead of hanging")
+}
+
+func TestWithPreset(t *testing.T) {
+	require.Same(t, nvidiaVideoBackend, nvidiaVideoBackend.withPreset(""))
+	bound := nvidiaVideoBackend.withPreset("p7")
+	require.NotSame(t, nvidiaVideoBackend, bound)
+	require.Equal(t, "p7", bound.preset)
+	require.Empty(t, nvidiaVideoBackend.preset, "the shared backend is not mutated")
+	require.Same(t, bound, bound.withPreset("p7"))
 }
 
 func factoryNames(elements []*gst.Element) []string {
@@ -84,18 +124,48 @@ func TestCPUConverters(t *testing.T) {
 	require.Equal(t, []string{"videoconvert"}, factoryNames(elements))
 }
 
-func requireNvidiaElements(t *testing.T) {
+func requireNvidiaEncoder(t *testing.T) {
 	t.Helper()
 	gst.Init(nil)
-	for _, name := range nvidiaElementFactories {
-		if gst.Find(name) == nil {
-			t.Skipf("%s is not installed", name)
-		}
+	if gst.Find("nvh264enc") == nil {
+		t.Skip("nvh264enc is not installed")
 	}
 }
 
+func requireNoNvidiaEncoder(t *testing.T) {
+	t.Helper()
+	gst.Init(nil)
+	if gst.Find("nvh264enc") != nil {
+		t.Skip("nvh264enc is installed")
+	}
+}
+
+func TestNvidiaEncodeVideoOutput(t *testing.T) {
+	requireNvidiaEncoder(t)
+
+	out := newTestVideoOutput(t, nvidiaEncodeVideoBackend.withPreset("p5"), livekit.VideoCodec_H264_BASELINE)
+
+	require.Equal(t,
+		[]string{"queue", "videoscale", "capsfilter", "queue", "nvh264enc", "capsfilter", "queue", "appsink"},
+		factoryNames(out.elements),
+	)
+
+	bitrate, err := out.enc.GetProperty("bitrate")
+	require.NoError(t, err)
+	require.Equal(t, uint(2_000_000/1024), bitrate)
+
+	converters, err := nvidiaEncodeVideoBackend.newConverters()
+	require.NoError(t, err)
+	require.Equal(t, []string{"videoconvert", "capsfilter"}, factoryNames(converters))
+
+	require.NoError(t, nvidiaEncodeVideoBackend.smokeEncode(3))
+}
+
 func TestNvidiaVideoOutput(t *testing.T) {
-	requireNvidiaElements(t)
+	requireNvidiaEncoder(t)
+	if gst.Find("cudaconvertscale") == nil {
+		t.Skip("cudaconvertscale is not installed, NVRTC is missing")
+	}
 
 	out := newTestVideoOutput(t, nvidiaVideoBackend, livekit.VideoCodec_H264_BASELINE)
 
@@ -104,11 +174,9 @@ func TestNvidiaVideoOutput(t *testing.T) {
 		factoryNames(out.elements),
 	)
 
-	bitrate, err := out.enc.GetProperty("bitrate")
-	require.NoError(t, err)
-	require.Equal(t, uint(2_000_000/1024), bitrate)
-
 	converters, err := nvidiaVideoBackend.newConverters()
 	require.NoError(t, err)
 	require.Equal(t, []string{"cudaupload", "cudaconvert", "capsfilter"}, factoryNames(converters))
+
+	require.NoError(t, nvidiaVideoBackend.smokeEncode(3))
 }
