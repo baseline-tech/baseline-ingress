@@ -53,6 +53,9 @@ type Params struct {
 	AudioEncodingOptions *livekit.IngressAudioEncodingOptions
 	VideoEncodingOptions *livekit.IngressVideoEncodingOptions
 	Live                 bool
+	// NVENC encoder sessions admission reserved for the session. 0 with the GPU enabled means
+	// the session spilled over to the CPU, and the handler is told to transcode there.
+	GPUEncoders int32
 
 	// connection info
 	WsUrl     string
@@ -202,6 +205,16 @@ func GetVideoCodec(info *livekit.IngressInfo) livekit.VideoCodec {
 		return livekit.VideoCodec_DEFAULT_VC
 	}
 	return options.VideoCodec
+}
+
+// GetVideoLayerCount returns the simulcast layers the session encodes, before any the source
+// resolution drops.
+func GetVideoLayerCount(info *livekit.IngressInfo) int {
+	options, err := getVideoEncodingOptions(info.GetVideo())
+	if err != nil {
+		return 0
+	}
+	return len(options.Layers)
 }
 
 func getLive(info *livekit.IngressInfo) bool {

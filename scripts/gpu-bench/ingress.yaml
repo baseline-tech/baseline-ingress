@@ -1,0 +1,15 @@
+api_key: devkey
+api_secret: secret
+ws_url: ws://livekit:7880
+redis:
+  address: redis:6379
+rtmp_port: 1935
+health_port: 8080
+prometheus_port: 9090
+logging:
+  level: info
+gpu:
+  enabled: true
+  max_encoder_sessions: 8
+  cpu_cost: 0.5
+  preset: p3

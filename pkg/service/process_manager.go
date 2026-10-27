@@ -161,7 +161,7 @@ func (s *ProcessManager) startIngress(ctx context.Context, p *params.Params, clo
 		return err
 	}
 
-	s.sm.IngressStarted(p.IngressInfo, h)
+	s.sm.IngressStarted(p.IngressInfo, p.GPUEncoders, h)
 	s.stateNotifier.SessionStarted(ctx, p.ProjectID, p.IngressInfo)
 
 	s.mu.Lock()

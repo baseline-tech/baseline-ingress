@@ -68,8 +68,12 @@ type Monitor struct {
 	procStats *hwstats.CPUStats
 
 	pendingCPUs atomic.Float64
-	gpuSessions atomic.Int32
-	pendingGPU  atomic.Int32
+
+	// NVENC encoder sessions held per session, keyed by resource ID. A pending entry is written by
+	// AcceptIngress and expires after a second, a running one lasts from IngressStarted to IngressEnded.
+	gpuLock    sync.Mutex
+	gpuPending map[string]int32
+	gpuRunning map[string]int32
 
 	usageLock sync.Mutex
 	usage     map[string]*SessionUsage // resourceID -> usage
@@ -107,8 +111,10 @@ type handlerRun struct {
 
 func NewMonitor() *Monitor {
 	return &Monitor{
-		usage:    make(map[string]*SessionUsage),
-		handlers: make(map[int]*handlerRun),
+		usage:      make(map[string]*SessionUsage),
+		handlers:   make(map[int]*handlerRun),
+		gpuPending: make(map[string]int32),
+		gpuRunning: make(map[string]int32),
 	}
 }
 
@@ -152,10 +158,10 @@ func (m *Monitor) Start(conf *config.Config) error {
 	m.promGPUSessions = prometheus.NewGaugeFunc(prometheus.GaugeOpts{
 		Namespace:   promNamespace,
 		Subsystem:   promSubsystemIngress,
-		Name:        "gpu_sessions",
+		Name:        "gpu_encoder_sessions",
 		ConstLabels: prometheus.Labels{promLabelNodeID: conf.NodeID},
 	}, func() float64 {
-		return float64(m.gpuSessions.Load())
+		return float64(m.gpuInUse())
 	})
 	m.requestGauge = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Namespace:   promNamespace,
@@ -362,32 +368,53 @@ func (m *Monitor) CanAccept() bool {
 	m.costConfigLock.Lock()
 	defer m.costConfigLock.Unlock()
 
-	if m.gpuConfig.Enabled {
-		return m.gpuSessions.Load()+m.pendingGPU.Load() < int32(m.gpuConfig.MaxSessions) &&
-			m.getAvailable(m.cpuCostConfig.MinIdleRatio) > m.gpuConfig.CPUCost
+	available := m.getAvailable(m.cpuCostConfig.MinIdleRatio)
+	if m.gpuConfig.Enabled && m.gpuInUse() < int32(m.gpuConfig.MaxEncoderSessions) && available > m.gpuConfig.CPUCost {
+		return true
 	}
 
-	return m.getAvailable(m.cpuCostConfig.MinIdleRatio) > m.maxCost
+	return available > m.maxCost
 }
 
-// usesGPU returns true if the video of the session is transcoded on the GPU
-func (m *Monitor) usesGPU(info *livekit.IngressInfo) bool {
+// gpuEncoders returns the NVENC encoder sessions the session holds if its video goes to the GPU,
+// one per simulcast layer, and 0 for a session the CPU transcodes.
+func (m *Monitor) gpuEncoders(info *livekit.IngressInfo) int32 {
 	switch info.InputType {
 	case livekit.IngressInput_RTMP_INPUT, livekit.IngressInput_URL_INPUT:
 	case livekit.IngressInput_WHIP_INPUT:
 		if !info.GetEnableTranscoding() {
-			return false
+			return 0
 		}
 	default:
-		return false
+		return 0
 	}
 
-	return m.gpuConfig.Encodes(params.GetVideoCodec(info))
+	if !m.gpuConfig.Encodes(params.GetVideoCodec(info)) {
+		return 0
+	}
+	return int32(max(params.GetVideoLayerCount(info), 1))
 }
 
-func (m *Monitor) canAcceptIngress(info *livekit.IngressInfo, alreadyCommitted bool) (accept bool, cpuHold float64, available float64, gpu bool) {
+func (m *Monitor) gpuInUse() int32 {
+	m.gpuLock.Lock()
+	defer m.gpuLock.Unlock()
+
+	var n int32
+	for _, encoders := range m.gpuPending {
+		n += encoders
+	}
+	for _, encoders := range m.gpuRunning {
+		n += encoders
+	}
+	return n
+}
+
+// canAcceptIngress decides admission. gpuEncoders is the NVENC sessions the session takes: a
+// GPU-eligible session gets them when they fit, and spills over to the CPU at the upstream CPU
+// cost when they do not.
+func (m *Monitor) canAcceptIngress(info *livekit.IngressInfo, alreadyCommitted bool) (accept bool, cpuHold float64, available float64, gpuEncoders int32) {
 	if !m.started.IsBroken() || m.shutdown.IsBroken() {
-		return false, 0, 0, false
+		return false, 0, 0, 0
 	}
 
 	m.costConfigLock.Lock()
@@ -420,14 +447,17 @@ func (m *Monitor) canAcceptIngress(info *livekit.IngressInfo, alreadyCommitted b
 		logger.Errorw("unsupported request type", errors.New("invalid parameter"))
 	}
 
-	if gpu = m.usesGPU(info); gpu {
-		accept = m.gpuSessions.Load()+m.pendingGPU.Load() < int32(m.gpuConfig.MaxSessions) && available > m.gpuConfig.CPUCost
+	wanted := m.gpuEncoders(info)
+	gpuInUse := m.gpuInUse()
+	if wanted > 0 && gpuInUse+wanted <= int32(m.gpuConfig.MaxEncoderSessions) && available > m.gpuConfig.CPUCost {
+		accept = true
 		cpuHold = m.gpuConfig.CPUCost
+		gpuEncoders = wanted
 	}
 
-	logger.Debugw("checking if request can be handled", "inputType", info.InputType, "accept", accept, "available", available, "cpuHold", cpuHold, "idle", m.cpuStats.GetCPUIdle(), "pending", m.pendingCPUs.Load(), "gpu", gpu, "gpuSessions", m.gpuSessions.Load(), "pendingGPU", m.pendingGPU.Load())
+	logger.Debugw("checking if request can be handled", "inputType", info.InputType, "accept", accept, "available", available, "cpuHold", cpuHold, "idle", m.cpuStats.GetCPUIdle(), "pending", m.pendingCPUs.Load(), "gpuEncoders", gpuEncoders, "gpuEncodersWanted", wanted, "gpuInUse", gpuInUse)
 
-	return accept, cpuHold, available, gpu
+	return accept, cpuHold, available, gpuEncoders
 }
 
 func (m *Monitor) CanAcceptIngress(info *livekit.IngressInfo) bool {
@@ -438,30 +468,43 @@ func (m *Monitor) CanAcceptIngress(info *livekit.IngressInfo) bool {
 	return accept
 }
 
-func (m *Monitor) AcceptIngress(info *livekit.IngressInfo) bool {
-	accept, cpuHold, available, gpu := m.canAcceptIngress(info, true)
+// AcceptIngress admits a session and reserves its resources for a second, until IngressStarted
+// takes over. gpuEncoders is the NVENC sessions reserved; 0 means the CPU transcodes the video,
+// and the caller hands that decision to the handler.
+func (m *Monitor) AcceptIngress(info *livekit.IngressInfo) (accept bool, gpuEncoders int32) {
+	accept, cpuHold, available, gpuEncoders := m.canAcceptIngress(info, true)
 
 	if accept {
+		resourceID := info.GetState().GetResourceId()
 		m.pendingCPUs.Add(cpuHold)
-		if gpu {
-			m.pendingGPU.Inc()
+		if gpuEncoders > 0 {
+			m.gpuLock.Lock()
+			m.gpuPending[resourceID] = gpuEncoders
+			m.gpuLock.Unlock()
+		} else if wanted := m.gpuEncoders(info); wanted > 0 {
+			logger.Infow("gpu encoder sessions exhausted, transcoding on the cpu", "ingressID", info.IngressId, "resourceID", resourceID, "gpuEncodersWanted", wanted, "gpuInUse", m.gpuInUse(), "maxEncoderSessions", m.gpuConfig.MaxEncoderSessions)
 		}
 		time.AfterFunc(time.Second, func() {
 			m.pendingCPUs.Sub(cpuHold)
-			if gpu {
-				m.pendingGPU.Dec()
-			}
+			m.gpuLock.Lock()
+			delete(m.gpuPending, resourceID)
+			m.gpuLock.Unlock()
 		})
 	}
 
-	logger.Debugw("cpu request", "accepted", accept, "availableCPUs", available, "numCPUs", m.cpuStats.NumCPU())
-	return accept
+	logger.Debugw("cpu request", "accepted", accept, "availableCPUs", available, "numCPUs", m.cpuStats.NumCPU(), "gpuEncoders", gpuEncoders)
+	return accept, gpuEncoders
 }
 
-func (m *Monitor) IngressStarted(info *livekit.IngressInfo) {
-	if m.usesGPU(info) {
-		m.gpuSessions.Inc()
+// IngressStarted records a running session. gpuEncoders is what AcceptIngress reserved for it.
+func (m *Monitor) IngressStarted(info *livekit.IngressInfo, gpuEncoders int32) {
+	resourceID := info.GetState().GetResourceId()
+	m.gpuLock.Lock()
+	delete(m.gpuPending, resourceID)
+	if gpuEncoders > 0 {
+		m.gpuRunning[resourceID] = gpuEncoders
 	}
+	m.gpuLock.Unlock()
 
 	switch info.InputType {
 	case livekit.IngressInput_RTMP_INPUT:
@@ -475,9 +518,9 @@ func (m *Monitor) IngressStarted(info *livekit.IngressInfo) {
 }
 
 func (m *Monitor) IngressEnded(info *livekit.IngressInfo) {
-	if m.usesGPU(info) {
-		m.gpuSessions.Dec()
-	}
+	m.gpuLock.Lock()
+	delete(m.gpuRunning, info.GetState().GetResourceId())
+	m.gpuLock.Unlock()
 
 	switch info.InputType {
 	case livekit.IngressInput_RTMP_INPUT:

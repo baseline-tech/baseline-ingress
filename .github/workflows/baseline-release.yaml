@@ -1,0 +1,104 @@
+# Baseline fork CI and release.
+#
+# Every branch push runs the checks on a native amd64 runner. A tag like
+# v1.5.0-gpu.1 (pushed by the baseline-release skill) runs the checks, then
+# publishes ghcr.io/baseline-tech/baseline-ingress. The image is amd64 only:
+# NVIDIA GPU hosts are amd64 and the arm64 NVRTC install is unverified.
+
+name: Baseline release
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ['**']
+    tags: ['v*-gpu.*']
+
+permissions:
+  contents: read
+
+env:
+  IMAGE: ghcr.io/baseline-tech/baseline-ingress
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: true
+
+      - name: Resolve GStreamer version
+        id: gst-version
+        run: |
+          version=$(cat .gst-version)
+          if [ -z "$version" ]; then echo ".gst-version is empty" >&2; exit 1; fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Build test image
+        run: |
+          docker build \
+            --target builder \
+            -t ingress-builder \
+            -f ./build/test/Dockerfile \
+            --build-arg GSTVERSION=${{ steps.gst-version.outputs.version }} .
+
+      - name: gofmt, vet and unit tests
+        run: |
+          docker run --rm ingress-builder sh -ec '
+            unformatted=$(gofmt -l pkg cmd)
+            if [ -n "$unformatted" ]; then echo "gofmt needed: $unformatted" >&2; exit 1; fi
+            go vet ./pkg/... ./cmd/...
+            go test ./pkg/... ./cmd/...
+          '
+
+  docker:
+    needs: test
+    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Resolve GStreamer version
+        id: gst-version
+        run: |
+          version=$(cat .gst-version)
+          if [ -z "$version" ]; then echo ".gst-version is empty" >&2; exit 1; fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Docker metadata
+        id: docker-md
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=ref,event=tag
+            type=sha,prefix=sha-
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/') }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: ./build/ingress/Dockerfile
+          push: true
+          platforms: linux/amd64
+          tags: ${{ steps.docker-md.outputs.tags }}
+          labels: ${{ steps.docker-md.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            GSTVERSION=${{ steps.gst-version.outputs.version }}
+            SECURITY_REFRESH=${{ github.run_id }}-${{ github.run_attempt }}

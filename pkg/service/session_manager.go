@@ -51,7 +51,8 @@ func NewSessionManager(monitor *stats.Monitor, rpcSrv rpc.IngressInternalServer)
 	}
 }
 
-func (sm *SessionManager) IngressStarted(info *livekit.IngressInfo, sessionAPI types.SessionAPI) {
+// IngressStarted records a running session. gpuEncoders is the NVENC sessions admission reserved for it.
+func (sm *SessionManager) IngressStarted(info *livekit.IngressInfo, gpuEncoders int32, sessionAPI types.SessionAPI) {
 	logger.Infow("ingress started", "ingressID", info.IngressId, "resourceID", info.State.ResourceId)
 
 	sm.lock.Lock()
@@ -69,7 +70,7 @@ func (sm *SessionManager) IngressStarted(info *livekit.IngressInfo, sessionAPI t
 
 	sm.sessions[info.State.ResourceId] = r
 
-	sm.monitor.IngressStarted(info)
+	sm.monitor.IngressStarted(info, gpuEncoders)
 }
 
 // HandlerStarted attributes the handler process pid to the session in info.

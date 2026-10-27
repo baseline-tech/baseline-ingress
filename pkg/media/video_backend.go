@@ -16,11 +16,13 @@ package media
 
 import (
 	"fmt"
+	"time"
 
 	"github.com/go-gst/go-gst/gst"
 
 	"github.com/livekit/ingress/pkg/config"
 	"github.com/livekit/protocol/livekit"
+	"github.com/livekit/protocol/logger"
 )
 
 type elementSpec struct {
@@ -29,16 +31,17 @@ type elementSpec struct {
 }
 
 type videoBackend struct {
-	name       string
+	tier       config.GPUTier
 	converters []elementSpec
 	scaler     string
 	rawCaps    string
+	preset     string // nvh264enc preset, bound by withPreset
 
-	newH264Encoder func(layer *livekit.VideoLayer, threadCount uint) (*gst.Element, error)
+	newH264Encoder func(preset string, layer *livekit.VideoLayer, threadCount uint) (*gst.Element, error)
 }
 
 var cpuVideoBackend = &videoBackend{
-	name:           "cpu",
+	tier:           config.GPUTierCPU,
 	converters:     []elementSpec{{factory: "videoconvert"}},
 	scaler:         "videoscale",
 	rawCaps:        "video/x-raw",
@@ -46,7 +49,7 @@ var cpuVideoBackend = &videoBackend{
 }
 
 var nvidiaVideoBackend = &videoBackend{
-	name: "nvidia",
+	tier: config.GPUTierNvidia,
 	converters: []elementSpec{
 		{factory: "cudaupload"},
 		{factory: "cudaconvert"},
@@ -57,13 +60,76 @@ var nvidiaVideoBackend = &videoBackend{
 	newH264Encoder: newNvH264Encoder,
 }
 
-var nvidiaElementFactories = []string{"cudaupload", "cudaconvert", "cudaconvertscale", "nvh264enc"}
+var nvidiaEncodeVideoBackend = &videoBackend{
+	tier: config.GPUTierNvidiaEncode,
+	converters: []elementSpec{
+		{factory: "videoconvert"},
+		{factory: "capsfilter", caps: "video/x-raw,format=NV12"},
+	},
+	scaler:         "videoscale",
+	rawCaps:        "video/x-raw",
+	newH264Encoder: newNvH264Encoder,
+}
 
-func selectVideoBackend(gpu config.GPUConfig, codec livekit.VideoCodec) *videoBackend {
-	if gpu.Encodes(codec) {
-		return nvidiaVideoBackend
+var videoBackends = map[config.GPUTier]*videoBackend{
+	config.GPUTierNvidia:       nvidiaVideoBackend,
+	config.GPUTierNvidiaEncode: nvidiaEncodeVideoBackend,
+	config.GPUTierCPU:          cpuVideoBackend,
+}
+
+// Smoke encode bounds. nvh264enc takes 160x64 and up.
+const (
+	smokeWidth   = 320
+	smokeHeight  = 240
+	smokeFrames  = 5
+	smokeTimeout = 10 * time.Second
+)
+
+type tierFailure struct {
+	tier config.GPUTier
+	err  error
+}
+
+// resolveVideoTier walks down from first and returns the first tier whose H.264 chain encodes a
+// few frames with encoders concurrent encoder sessions, plus why each tier above it failed.
+// The CPU tier is the floor and is not tested.
+func resolveVideoTier(gpu config.GPUConfig, first config.GPUTier, encoders int) (config.GPUTier, []tierFailure) {
+	var failures []tierFailure
+	for tier := first; tier.UsesGPU(); tier = tier.Next() {
+		err := videoBackends[tier].withPreset(gpu.Preset).smokeEncode(encoders)
+		if err == nil {
+			return tier, failures
+		}
+		failures = append(failures, tierFailure{tier: tier, err: err})
 	}
-	return cpuVideoBackend
+	return config.GPUTierCPU, failures
+}
+
+// selectVideoBackend picks the backend for a stream with encoders simulcast layers. The GPU tier
+// in gpu is smoke tested with that many encoder sessions first, and a tier that fails hands the
+// whole stream to the next one, down to the CPU, before anything is built.
+func selectVideoBackend(gpu config.GPUConfig, codec livekit.VideoCodec, encoders int) *videoBackend {
+	if !gpu.Encodes(codec) {
+		return cpuVideoBackend
+	}
+	tier, failures := resolveVideoTier(gpu, gpu.Tier, encoders)
+	for _, f := range failures {
+		logger.Warnw("gpu tier failed its smoke encode, falling back", f.err, "tier", f.tier, "next", f.tier.Next(), "encoders", encoders)
+	}
+	return videoBackends[tier].withPreset(gpu.Preset)
+}
+
+func (b *videoBackend) withPreset(preset string) *videoBackend {
+	if preset == "" || preset == b.preset {
+		return b
+	}
+	c := *b
+	c.preset = preset
+	return &c
+}
+
+func (b *videoBackend) h264Encoder(layer *livekit.VideoLayer, threadCount uint) (*gst.Element, error) {
+	return b.newH264Encoder(b.preset, layer, threadCount)
 }
 
 func (b *videoBackend) newConverters() ([]*gst.Element, error) {
@@ -75,6 +141,81 @@ func (b *videoBackend) newScalers(layer *livekit.VideoLayer) ([]*gst.Element, er
 		{factory: b.scaler},
 		{factory: "capsfilter", caps: fmt.Sprintf("%s,width=%d,height=%d", b.rawCaps, layer.Width, layer.Height)},
 	})
+}
+
+// smokeEncode runs smokeFrames frames through the backend's real H.264 chain, fanned out to
+// encoders encoder sessions, into fakesinks, and returns the first pipeline error.
+func (b *videoBackend) smokeEncode(encoders int) error {
+	pipeline, err := gst.NewPipeline("")
+	if err != nil {
+		return err
+	}
+	defer func() { _ = pipeline.SetState(gst.StateNull) }()
+
+	layer := &livekit.VideoLayer{Quality: livekit.VideoQuality_HIGH, Width: smokeWidth, Height: smokeHeight, Bitrate: 500_000}
+
+	head, err := newElements(append([]elementSpec{
+		{factory: "videotestsrc"},
+		{factory: "capsfilter", caps: fmt.Sprintf("video/x-raw,format=I420,width=%d,height=%d,framerate=30/1", smokeWidth, smokeHeight)},
+	}, b.converters...))
+	if err != nil {
+		return err
+	}
+	if err = head[0].SetProperty("num-buffers", smokeFrames); err != nil {
+		return err
+	}
+	tee, err := gst.NewElement("tee")
+	if err != nil {
+		return err
+	}
+	head = append(head, tee)
+	if err = pipeline.AddMany(head...); err != nil {
+		return err
+	}
+	if err = gst.ElementLinkMany(head...); err != nil {
+		return err
+	}
+
+	for i := 0; i < encoders; i++ {
+		branch, err := newElements([]elementSpec{{factory: "queue"}})
+		if err != nil {
+			return err
+		}
+		scalers, err := b.newScalers(layer)
+		if err != nil {
+			return err
+		}
+		enc, err := b.h264Encoder(layer, 1)
+		if err != nil {
+			return err
+		}
+		sink, err := gst.NewElement("fakesink")
+		if err != nil {
+			return err
+		}
+		branch = append(branch, scalers...)
+		branch = append(branch, enc, sink)
+		if err = pipeline.AddMany(branch...); err != nil {
+			return err
+		}
+		if err = gst.ElementLinkMany(append([]*gst.Element{tee}, branch...)...); err != nil {
+			return err
+		}
+	}
+
+	if err = pipeline.SetState(gst.StatePlaying); err != nil {
+		return err
+	}
+
+	msg := pipeline.GetPipelineBus().TimedPopFiltered(gst.ClockTime(smokeTimeout), gst.MessageEOS|gst.MessageError)
+	switch {
+	case msg == nil:
+		return fmt.Errorf("no EOS after %s", smokeTimeout)
+	case msg.Type() == gst.MessageError:
+		gerr := msg.ParseError()
+		return fmt.Errorf("%s (%s)", gerr.Error(), gerr.DebugString())
+	}
+	return nil
 }
 
 func newElements(specs []elementSpec) ([]*gst.Element, error) {
@@ -94,7 +235,7 @@ func newElements(specs []elementSpec) ([]*gst.Element, error) {
 	return elements, nil
 }
 
-func newX264Encoder(layer *livekit.VideoLayer, threadCount uint) (*gst.Element, error) {
+func newX264Encoder(_ string, layer *livekit.VideoLayer, threadCount uint) (*gst.Element, error) {
 	enc, err := gst.NewElement("x264enc")
 	if err != nil {
 		return nil, err
@@ -120,13 +261,13 @@ func newX264Encoder(layer *livekit.VideoLayer, threadCount uint) (*gst.Element, 
 	return enc, nil
 }
 
-func newNvH264Encoder(layer *livekit.VideoLayer, _ uint) (*gst.Element, error) {
+func newNvH264Encoder(preset string, layer *livekit.VideoLayer, _ uint) (*gst.Element, error) {
 	enc, err := gst.NewElement("nvh264enc")
 	if err != nil {
 		return nil, err
 	}
 
-	// nvh264enc scales bitrate by 1024, not 1000
+	// nvh264enc takes kbit/s and multiplies by 1024, x264enc by 1000
 	if err = enc.SetProperty("bitrate", uint(layer.Bitrate/1024)); err != nil {
 		return nil, err
 	}
@@ -141,9 +282,12 @@ func newNvH264Encoder(layer *livekit.VideoLayer, _ uint) (*gst.Element, error) {
 		return nil, err
 	}
 
+	if preset == "" {
+		preset = config.DefaultGPUPreset
+	}
 	enc.SetArg("rc-mode", "cbr")
 	enc.SetArg("tune", "ultra-low-latency")
-	enc.SetArg("preset", "p3")
+	enc.SetArg("preset", preset)
 
 	return enc, nil
 }
