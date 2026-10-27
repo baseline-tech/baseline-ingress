@@ -110,6 +110,25 @@ The config file can be added to a mounted volume with its location passed in the
 >
 > `max_decompressed_size` only affects reading, so it can be set ahead of `quality`.
 
+#### GPU transcoding (NVIDIA)
+
+H.264 transcoding can run on NVIDIA GPUs through GStreamer's `nvcodec` plugin. It is off by default and does not change what is sent to the LiveKit server.
+
+```yaml
+gpu:
+  enabled: true
+  # concurrent GPU transcoding sessions this node accepts
+  max_sessions: 8
+  # CPU cost reserved per GPU session, instead of the full rtmp/url cpu cost
+  cpu_cost: 0.5
+```
+
+- Only `H264_BASELINE` transcoding sessions (RTMP, URL, and WHIP with transcoding) use the GPU. VP8 and WHIP bypass sessions stay on the CPU and do not count against `max_sessions`.
+- Frames are uploaded once, converted and scaled with `cudaconvert`/`cudaconvertscale`, and encoded with `nvh264enc` (constant bitrate, low latency, no B-frames).
+- At startup the service checks that `cudaupload`, `cudaconvert`, `cudaconvertscale` and `nvh264enc` are available. If any is missing it logs `gpu transcoding unavailable, using the cpu` and runs every session on the CPU.
+- Requirements: an NVIDIA GPU with NVENC, a container started with the NVIDIA container toolkit (`--gpus all`, `NVIDIA_DRIVER_CAPABILITIES=compute,video,utility`), and the CUDA NVRTC library (`libnvrtc`) in the image, which `cudaconvert` needs and the stock image does not ship.
+- `gpu` is read at startup and is not hot reloaded. `max_sessions` also bounds the sessions the encoder hardware can sustain, so tune it per GPU.
+
 In order for the LiveKit server to be able to create Ingress sessions, an `ingress` section must also be added to the livekit-server configuration:
 
 ```yaml
