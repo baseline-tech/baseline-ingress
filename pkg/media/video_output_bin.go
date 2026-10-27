@@ -27,7 +27,7 @@ type VideoOutputBin struct {
 	tee                  *gst.Element
 }
 
-func NewVideoOutputBin(options *livekit.IngressVideoEncodingOptions, outputs []*Output) (*VideoOutputBin, error) {
+func NewVideoOutputBin(backend *videoBackend, options *livekit.IngressVideoEncodingOptions, outputs []*Output) (*VideoOutputBin, error) {
 	o := &VideoOutputBin{}
 
 	o.bin = gst.NewBin("video output bin")
@@ -43,11 +43,11 @@ func NewVideoOutputBin(options *livekit.IngressVideoEncodingOptions, outputs []*
 		o.preProcessorElements = append(o.preProcessorElements, videoRate)
 	}
 
-	videoConvert, err := gst.NewElement("videoconvert")
+	converters, err := backend.newConverters()
 	if err != nil {
 		return nil, err
 	}
-	o.preProcessorElements = append(o.preProcessorElements, videoConvert)
+	o.preProcessorElements = append(o.preProcessorElements, converters...)
 
 	err = o.bin.AddMany(o.preProcessorElements...)
 	if err != nil {

@@ -86,7 +86,7 @@ type AudioOutput struct {
 	codec livekit.AudioCodec
 }
 
-func NewVideoOutput(codec livekit.VideoCodec, layer *livekit.VideoLayer, outputSync *utils.TrackOutputSynchronizer, isPlayingTooSlow func() bool, statsGatherer *stats.LocalMediaStatsGatherer, eos *eosDispatcher) (*VideoOutput, error) {
+func NewVideoOutput(backend *videoBackend, codec livekit.VideoCodec, layer *livekit.VideoLayer, outputSync *utils.TrackOutputSynchronizer, isPlayingTooSlow func() bool, statsGatherer *stats.LocalMediaStatsGatherer, eos *eosDispatcher) (*VideoOutput, error) {
 	log := logger.GetLogger().WithValues("kind", "video", "layer", layer.Quality.String())
 	e, err := newVideoOutput(codec, outputSync, isPlayingTooSlow, eos, log)
 	if err != nil {
@@ -99,7 +99,7 @@ func NewVideoOutput(codec livekit.VideoCodec, layer *livekit.VideoLayer, outputS
 
 	threadCount := getVideoEncoderThreadCount(layer)
 
-	e.logger.Infow("video layer", "width", layer.Width, "height", layer.Height, "threads", threadCount)
+	e.logger.Infow("video layer", "backend", backend.name, "width", layer.Width, "height", layer.Height, "threads", threadCount)
 
 	queueIn, err := gst.NewElementWithName("queue", fmt.Sprintf("video_%s_in", layer.Quality.String()))
 	if err != nil {
@@ -124,21 +124,7 @@ func NewVideoOutput(codec livekit.VideoCodec, layer *livekit.VideoLayer, outputS
 		pad.RemoveProbe(id)
 	}
 
-	videoScale, err := gst.NewElement("videoscale")
-	if err != nil {
-		return nil, err
-	}
-	inputCaps, err := gst.NewElement("capsfilter")
-	if err != nil {
-		return nil, err
-	}
-	err = inputCaps.SetProperty("caps", gst.NewCapsFromString(
-		fmt.Sprintf(
-			"video/x-raw,width=%d,height=%d",
-			layer.Width,
-			layer.Height,
-		),
-	))
+	scalers, err := backend.newScalers(layer)
 	if err != nil {
 		return nil, err
 	}
@@ -151,33 +137,15 @@ func NewVideoOutput(codec livekit.VideoCodec, layer *livekit.VideoLayer, outputS
 		return nil, err
 	}
 
-	e.elements = []*gst.Element{
-		queueIn, videoScale, inputCaps, queueEnc,
-	}
+	e.elements = append([]*gst.Element{queueIn}, scalers...)
+	e.elements = append(e.elements, queueEnc)
 
 	switch codec {
 	case livekit.VideoCodec_H264_BASELINE:
-		e.enc, err = gst.NewElement("x264enc")
+		e.enc, err = backend.newH264Encoder(layer, threadCount)
 		if err != nil {
 			return nil, err
 		}
-
-		if err = e.enc.SetProperty("bitrate", uint(layer.Bitrate/1000)); err != nil {
-			return nil, err
-		}
-		// 1s VBV buffer size
-		if err = e.enc.SetProperty("vbv-buf-capacity", uint(1000)); err != nil {
-			return nil, err
-		}
-		if err = e.enc.SetProperty("byte-stream", true); err != nil {
-			return nil, err
-		}
-		if err = e.enc.SetProperty("threads", threadCount); err != nil {
-			return nil, err
-		}
-
-		e.enc.SetArg("tune", "zerolatency")
-		e.enc.SetArg("speed-preset", "veryfast")
 
 		profileCaps, err := gst.NewElement("capsfilter")
 		if err != nil {
