@@ -62,6 +62,24 @@ RUN if [ "$TARGETPLATFORM" = "linux/arm64" ]; then GOARCH=arm64; else GOARCH=amd
 ARG GSTVERSION
 FROM livekit/gstreamer:$GSTVERSION-prod
 
+ARG TARGETPLATFORM
+
+# NVRTC for GStreamer's cudaconvert/cudaconvertscale, which compile their kernels at
+# runtime. gst-cuda dlopens the unversioned "libnvrtc.so" (or $GST_CUDA_NVRTC_LIBNAME),
+# which NVIDIA only ships as a versioned file, so link it and register the directory
+# with ldconfig. The .alt variants are a second ~110MB copy that gst-cuda never loads.
+# arm64 hosts use NVIDIA's sbsa repo.
+RUN if [ "$TARGETPLATFORM" = "linux/arm64" ]; then NVARCH=sbsa; else NVARCH=x86_64; fi && \
+    apt-get update && apt-get install -y wget ca-certificates && \
+    wget -q -O /tmp/cuda-keyring.deb "https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/$NVARCH/cuda-keyring_1.1-1_all.deb" && \
+    dpkg -i /tmp/cuda-keyring.deb && rm /tmp/cuda-keyring.deb && \
+    apt-get update && apt-get install -y --no-install-recommends cuda-nvrtc-12-8 && \
+    NVLIB=/usr/local/cuda-12.8/targets/$NVARCH-linux/lib && \
+    rm -f $NVLIB/*.alt.so* && \
+    ln -s "$(basename "$(ls $NVLIB/libnvrtc.so.12.*)")" $NVLIB/libnvrtc.so && \
+    echo "$NVLIB" > /etc/ld.so.conf.d/nvrtc.conf && ldconfig && \
+    rm -rf /var/lib/apt/lists/*
+
 # install wget for health check, pulling in security updates. SECURITY_REFRESH
 # busts the cache so the upgrade re-runs on every build.
 ARG SECURITY_REFRESH
