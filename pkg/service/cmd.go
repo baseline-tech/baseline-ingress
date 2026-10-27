@@ -25,12 +25,13 @@ import (
 
 	"github.com/livekit/protocol/logger"
 
+	"github.com/livekit/ingress/pkg/config"
 	"github.com/livekit/ingress/pkg/params"
 	"github.com/livekit/ingress/pkg/utils"
 )
 
 func NewCmd(_ context.Context, p *params.Params) (*exec.Cmd, error) {
-	confString, err := yaml.Marshal(p.Config)
+	confString, err := handlerConfigBody(p)
 	if err != nil {
 		logger.Errorw("could not marshal config", err)
 		return nil, err
@@ -89,4 +90,25 @@ func NewCmd(_ context.Context, p *params.Params) (*exec.Cmd, error) {
 	cmd.Stderr = l
 
 	return cmd, nil
+}
+
+// handlerConfigBody is the YAML config the handler reads. A session the GPU admitted inherits the
+// probed tier; one that spilled over to the CPU gets the cpu tier, so the handler never touches NVENC.
+func handlerConfigBody(p *params.Params) ([]byte, error) {
+	body, err := yaml.Marshal(p.Config)
+	if err != nil || !p.GPU.Enabled || p.GPUEncoders > 0 {
+		return body, err
+	}
+
+	var conf map[string]any
+	if err = yaml.Unmarshal(body, &conf); err != nil {
+		return nil, err
+	}
+	gpu, _ := conf["gpu"].(map[string]any)
+	if gpu == nil {
+		gpu = map[string]any{}
+		conf["gpu"] = gpu
+	}
+	gpu["tier"] = string(config.GPUTierCPU)
+	return yaml.Marshal(conf)
 }

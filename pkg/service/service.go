@@ -249,7 +249,7 @@ func (s *Service) HandleWHIPPublishRequest(streamKey, resourceId string) (p *par
 			p.SetStatus(livekit.IngressState_ENDPOINT_PUBLISHING, nil)
 			p.SendStateUpdate(ctx)
 
-			s.sm.IngressStarted(p.IngressInfo, &localSessionAPI{stats.LocalStatsUpdater{Params: p}, func(_ context.Context) {
+			s.sm.IngressStarted(p.IngressInfo, p.GPUEncoders, &localSessionAPI{stats.LocalStatsUpdater{Params: p}, func(_ context.Context) {
 				s.whipSrv.CloseHandler(resourceId)
 			}})
 			s.stateNotifier.SessionStarted(ctx, p.ProjectID, p.IngressInfo)
@@ -430,10 +430,12 @@ func (s *Service) handleNewPublisher(ctx context.Context, req requestParams) (*p
 	}
 
 	// check cpu load
-	if !s.monitor.AcceptIngress(p.IngressInfo) {
+	accept, gpuEncoders := s.monitor.AcceptIngress(p.IngressInfo)
+	if !accept {
 		logger.Debugw("rejecting ingress")
 		return nil, errors.ErrServerCapacityExceeded
 	}
+	p.GPUEncoders = gpuEncoders
 
 	return p, nil
 }
