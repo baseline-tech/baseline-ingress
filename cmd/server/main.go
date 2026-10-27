@@ -36,6 +36,7 @@ import (
 
 	"github.com/livekit/ingress/pkg/config"
 	"github.com/livekit/ingress/pkg/errors"
+	"github.com/livekit/ingress/pkg/media"
 	"github.com/livekit/ingress/pkg/params"
 	"github.com/livekit/ingress/pkg/rtmp"
 	"github.com/livekit/ingress/pkg/service"
@@ -123,6 +124,8 @@ func runService(_ context.Context, c *cli.Command) error {
 	if err != nil {
 		return err
 	}
+
+	media.ProbeGPU(&conf.GPU)
 
 	rc, err := redis.GetRedisClient(conf.Redis)
 	if err != nil {
