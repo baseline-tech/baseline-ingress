@@ -195,6 +195,15 @@ func UpdateTranscodingEnabled(info *livekit.IngressInfo) {
 	}
 }
 
+// GetVideoCodec returns the codec the video of the session is encoded with.
+func GetVideoCodec(info *livekit.IngressInfo) livekit.VideoCodec {
+	options, err := getVideoEncodingOptions(info.GetVideo())
+	if err != nil {
+		return livekit.VideoCodec_DEFAULT_VC
+	}
+	return options.VideoCodec
+}
+
 func getLive(info *livekit.IngressInfo) bool {
 	switch info.InputType {
 	case livekit.IngressInput_URL_INPUT:
@@ -223,7 +232,7 @@ func getWHIPRelayUrlPrefix(conf *config.Config, resourceId string) string {
 }
 
 func getAudioEncodingOptions(options *livekit.IngressAudioOptions) (*livekit.IngressAudioEncodingOptions, error) {
-	switch o := options.EncodingOptions.(type) {
+	switch o := options.GetEncodingOptions().(type) {
 	case nil:
 		// default preset
 		return getOptionsForAudioPreset(livekit.IngressAudioEncodingPreset_OPUS_STEREO_96KBPS)
@@ -265,7 +274,7 @@ func populateAudioEncodingOptionsDefaults(options *livekit.IngressAudioEncodingO
 }
 
 func getVideoEncodingOptions(options *livekit.IngressVideoOptions) (*livekit.IngressVideoEncodingOptions, error) {
-	switch o := options.EncodingOptions.(type) {
+	switch o := options.GetEncodingOptions().(type) {
 	case nil:
 		// default preset
 		return getOptionsForVideoPreset(livekit.IngressVideoEncodingPreset_H264_720P_30FPS_3_LAYERS)

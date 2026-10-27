@@ -156,3 +156,94 @@ cpu_cost:
 
 	require.Nil(t, m.SessionEnded("res_test"), "usage is reported once")
 }
+
+func TestGPUAdmission(t *testing.T) {
+	conf, err := config.NewConfig(`
+redis:
+  address: localhost:6379
+ws_url: ws://localhost:7880
+api_key: key
+api_secret: secret
+cpu_cost:
+  min_idle_ratio: 0.01
+  rtmp_cpu_cost: 0.0001
+  url_cpu_cost: 0.0001
+gpu:
+  enabled: true
+  max_sessions: 2
+  cpu_cost: 0.0001
+`)
+	require.NoError(t, err)
+
+	m := NewMonitor()
+	require.NoError(t, m.Start(conf))
+	t.Cleanup(m.Stop)
+
+	rtmp := func() *livekit.IngressInfo {
+		return &livekit.IngressInfo{InputType: livekit.IngressInput_RTMP_INPUT, EnableTranscoding: proto.Bool(true)}
+	}
+	whipBypass := &livekit.IngressInfo{InputType: livekit.IngressInput_WHIP_INPUT, EnableTranscoding: proto.Bool(false)}
+	vp8 := &livekit.IngressInfo{
+		InputType:         livekit.IngressInput_URL_INPUT,
+		EnableTranscoding: proto.Bool(true),
+		Video: &livekit.IngressVideoOptions{
+			EncodingOptions: &livekit.IngressVideoOptions_Options{
+				Options: &livekit.IngressVideoEncodingOptions{VideoCodec: livekit.VideoCodec_VP8},
+			},
+		},
+	}
+
+	first, second := rtmp(), rtmp()
+	require.Eventually(t, m.CanAccept, 5*time.Second, 50*time.Millisecond, "the cpu sampler reports idle time")
+	require.True(t, m.AcceptIngress(first))
+	require.True(t, m.AcceptIngress(second))
+	require.False(t, m.AcceptIngress(rtmp()), "a third session does not fit in max_sessions")
+	require.False(t, m.CanAccept(), "a node without a free gpu session is not available")
+
+	m.IngressStarted(first)
+	m.IngressStarted(second)
+	require.Equal(t, int32(2), m.gpuSessions.Load())
+	require.False(t, m.CanAcceptIngress(rtmp()))
+
+	require.True(t, m.CanAcceptIngress(whipBypass), "bypassed whip does not use the gpu")
+	require.True(t, m.CanAcceptIngress(vp8), "vp8 is encoded on the cpu")
+	m.IngressStarted(vp8)
+	m.IngressStarted(whipBypass)
+	require.Equal(t, int32(2), m.gpuSessions.Load(), "only gpu transcoded sessions are counted")
+	m.IngressEnded(vp8)
+	m.IngressEnded(whipBypass)
+	require.Equal(t, int32(2), m.gpuSessions.Load())
+
+	m.IngressEnded(first)
+	require.Equal(t, int32(1), m.gpuSessions.Load())
+	require.Eventually(t, func() bool { return m.CanAcceptIngress(rtmp()) && m.CanAccept() },
+		3*time.Second, 50*time.Millisecond, "an ended session frees its gpu session once reservations expire")
+}
+
+func TestGPUDisabledAdmissionIsUnchanged(t *testing.T) {
+	conf, err := config.NewConfig(`
+redis:
+  address: localhost:6379
+ws_url: ws://localhost:7880
+api_key: key
+api_secret: secret
+cpu_cost:
+  min_idle_ratio: 0.01
+  rtmp_cpu_cost: 0.0001
+gpu:
+  max_sessions: 1
+`)
+	require.NoError(t, err)
+
+	m := NewMonitor()
+	require.NoError(t, m.Start(conf))
+	t.Cleanup(m.Stop)
+
+	info := &livekit.IngressInfo{InputType: livekit.IngressInput_RTMP_INPUT, EnableTranscoding: proto.Bool(true)}
+	require.Eventually(t, func() bool { return m.CanAcceptIngress(info) }, 5*time.Second, 50*time.Millisecond, "the cpu sampler reports idle time")
+	for range 3 {
+		require.True(t, m.CanAcceptIngress(info))
+		m.IngressStarted(info)
+	}
+	require.Zero(t, m.gpuSessions.Load())
+}

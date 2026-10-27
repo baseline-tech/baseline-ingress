@@ -21,6 +21,7 @@ import (
 	"gopkg.in/yaml.v3"
 
 	"github.com/livekit/mediatransportutil/pkg/rtcconfig"
+	"github.com/livekit/protocol/livekit"
 	"github.com/livekit/protocol/logger"
 	"github.com/livekit/protocol/logger/medialogutils"
 	"github.com/livekit/protocol/logger/zaputil"
@@ -37,6 +38,9 @@ const (
 	DefaultRTMPPort      = 1935
 	DefaultWHIPPort      = 8080
 	DefaultHTTPRelayPort = 9090
+
+	DefaultGPUMaxSessions = 8
+	DefaultGPUCPUCost     = 0.5
 )
 
 var (
@@ -86,6 +90,9 @@ type ServiceConfig struct {
 	// CPU costs for various ingress types
 	CPUCost CPUCostConfig `yaml:"cpu_cost"`
 
+	// NVIDIA GPU video encoding for H.264 transcoding
+	GPU GPUConfig `yaml:"gpu"`
+
 	// Experimental config
 	// Reduces ingest e2e latency by dropping excess preroll buffers
 	EnableStreamLatencyReduction bool `yaml:"enable_stream_latency_reduction"`
@@ -107,6 +114,31 @@ type CPUCostConfig struct {
 	WHIPBypassTranscodingCpuCost float64 `yaml:"whip_bypass_transcoding_cpu_cost"`
 	URLCpuCost                   float64 `yaml:"url_cpu_cost"`
 	MinIdleRatio                 float64 `yaml:"min_idle_ratio"` // Target idle cpu ratio when deciding availability for new requests
+}
+
+type GPUConfig struct {
+	Enabled bool `yaml:"enabled"`
+	// Concurrent GPU transcoded sessions per node. Each one holds an NVENC session per simulcast layer,
+	// which some GPUs cap.
+	MaxSessions int `yaml:"max_sessions"`
+	// CPU cores reserved per GPU session for demuxing, audio and relaying
+	CPUCost float64 `yaml:"cpu_cost"`
+}
+
+// Encodes returns true if the GPU encodes the video codec. VP8 has no NVENC support.
+func (g GPUConfig) Encodes(codec livekit.VideoCodec) bool {
+	return g.Enabled && codec == livekit.VideoCodec_H264_BASELINE
+}
+
+func (g *GPUConfig) setDefaults() {
+	if g.MaxSessions <= 0 {
+		g.MaxSessions = DefaultGPUMaxSessions
+		logger.Infow("gpu max_sessions not set, using default", "maxSessions", g.MaxSessions)
+	}
+	if g.CPUCost <= 0 {
+		g.CPUCost = DefaultGPUCPUCost
+		logger.Infow("gpu cpu_cost not set, using default", "cpuCost", g.CPUCost)
+	}
 }
 
 func NewConfig(confString string) (*Config, error) {
@@ -148,6 +180,9 @@ func (c *ServiceConfig) InitDefaults() error {
 	}
 	if c.WHIPPort == 0 {
 		c.WHIPPort = DefaultWHIPPort
+	}
+	if c.GPU.Enabled {
+		c.GPU.setDefaults()
 	}
 
 	err := c.InitWhipConf()

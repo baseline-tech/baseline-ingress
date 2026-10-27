@@ -53,11 +53,13 @@ const (
 type Monitor struct {
 	costConfigLock sync.Mutex
 	cpuCostConfig  config.CPUCostConfig
+	gpuConfig      config.GPUConfig
 	maxCost        float64
 
 	promCPULoad            prometheus.Gauge
 	requestGauge           *prometheus.GaugeVec
 	promNodeAvailable      prometheus.GaugeFunc
+	promGPUSessions        prometheus.GaugeFunc
 	promPublicationCounter *prometheus.CounterVec
 
 	// cpuStats (cgroup idle) drives admission; procStats only attributes usage to handler processes.
@@ -66,6 +68,8 @@ type Monitor struct {
 	procStats *hwstats.CPUStats
 
 	pendingCPUs atomic.Float64
+	gpuSessions atomic.Int32
+	pendingGPU  atomic.Int32
 
 	usageLock sync.Mutex
 	usage     map[string]*SessionUsage // resourceID -> usage
@@ -119,6 +123,7 @@ func (m *Monitor) Start(conf *config.Config) error {
 	m.costConfigLock.Lock()
 	m.cpuStats = cpuStats
 	m.cpuCostConfig = conf.CPUCost
+	m.gpuConfig = conf.GPU
 
 	if err := m.checkCPUConfig(); err != nil {
 		m.costConfigLock.Unlock()
@@ -144,6 +149,14 @@ func (m *Monitor) Start(conf *config.Config) error {
 		}
 		return 0
 	})
+	m.promGPUSessions = prometheus.NewGaugeFunc(prometheus.GaugeOpts{
+		Namespace:   promNamespace,
+		Subsystem:   promSubsystemIngress,
+		Name:        "gpu_sessions",
+		ConstLabels: prometheus.Labels{promLabelNodeID: conf.NodeID},
+	}, func() float64 {
+		return float64(m.gpuSessions.Load())
+	})
 	m.requestGauge = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Namespace:   promNamespace,
 		Subsystem:   promSubsystemIngress,
@@ -157,7 +170,7 @@ func (m *Monitor) Start(conf *config.Config) error {
 		ConstLabels: prometheus.Labels{promLabelNodeID: conf.NodeID},
 	}, []string{promLabelType, "status"})
 
-	prometheus.MustRegister(m.promCPULoad, m.promNodeAvailable, m.requestGauge, m.promPublicationCounter)
+	prometheus.MustRegister(m.promCPULoad, m.promNodeAvailable, m.promGPUSessions, m.requestGauge, m.promPublicationCounter)
 
 	// handler usage is diagnostic only, so a failure here does not stop admission
 	procStats, err := hwstats.NewProcMonitor(m.updateHandlerStats)
@@ -204,6 +217,7 @@ func (m *Monitor) Stop() {
 	prometheus.Unregister(m.promCPULoad)
 	prometheus.Unregister(m.requestGauge)
 	prometheus.Unregister(m.promNodeAvailable)
+	prometheus.Unregister(m.promGPUSessions)
 	prometheus.Unregister(m.promPublicationCounter)
 }
 
@@ -348,16 +362,33 @@ func (m *Monitor) CanAccept() bool {
 	m.costConfigLock.Lock()
 	defer m.costConfigLock.Unlock()
 
+	if m.gpuConfig.Enabled {
+		return m.gpuSessions.Load()+m.pendingGPU.Load() < int32(m.gpuConfig.MaxSessions) &&
+			m.getAvailable(m.cpuCostConfig.MinIdleRatio) > m.gpuConfig.CPUCost
+	}
+
 	return m.getAvailable(m.cpuCostConfig.MinIdleRatio) > m.maxCost
 }
 
-func (m *Monitor) canAcceptIngress(info *livekit.IngressInfo, alreadyCommitted bool) (bool, float64, float64) {
-	if !m.started.IsBroken() || m.shutdown.IsBroken() {
-		return false, 0, 0
+// usesGPU returns true if the video of the session is transcoded on the GPU
+func (m *Monitor) usesGPU(info *livekit.IngressInfo) bool {
+	switch info.InputType {
+	case livekit.IngressInput_RTMP_INPUT, livekit.IngressInput_URL_INPUT:
+	case livekit.IngressInput_WHIP_INPUT:
+		if !info.GetEnableTranscoding() {
+			return false
+		}
+	default:
+		return false
 	}
 
-	var cpuHold float64
-	var accept bool
+	return m.gpuConfig.Encodes(params.GetVideoCodec(info))
+}
+
+func (m *Monitor) canAcceptIngress(info *livekit.IngressInfo, alreadyCommitted bool) (accept bool, cpuHold float64, available float64, gpu bool) {
+	if !m.started.IsBroken() || m.shutdown.IsBroken() {
+		return false, 0, 0, false
+	}
 
 	m.costConfigLock.Lock()
 	defer m.costConfigLock.Unlock()
@@ -367,7 +398,7 @@ func (m *Monitor) canAcceptIngress(info *livekit.IngressInfo, alreadyCommitted b
 		minIdle /= 2
 	}
 
-	available := m.getAvailable(minIdle)
+	available = m.getAvailable(minIdle)
 
 	switch info.InputType {
 	case livekit.IngressInput_RTMP_INPUT:
@@ -389,25 +420,38 @@ func (m *Monitor) canAcceptIngress(info *livekit.IngressInfo, alreadyCommitted b
 		logger.Errorw("unsupported request type", errors.New("invalid parameter"))
 	}
 
-	logger.Debugw("checking if request can be handled", "inputType", info.InputType, "accept", accept, "available", available, "cpuHold", cpuHold, "idle", m.cpuStats.GetCPUIdle(), "pending", m.pendingCPUs.Load())
+	if gpu = m.usesGPU(info); gpu {
+		accept = m.gpuSessions.Load()+m.pendingGPU.Load() < int32(m.gpuConfig.MaxSessions) && available > m.gpuConfig.CPUCost
+		cpuHold = m.gpuConfig.CPUCost
+	}
 
-	return accept, cpuHold, available
+	logger.Debugw("checking if request can be handled", "inputType", info.InputType, "accept", accept, "available", available, "cpuHold", cpuHold, "idle", m.cpuStats.GetCPUIdle(), "pending", m.pendingCPUs.Load(), "gpu", gpu, "gpuSessions", m.gpuSessions.Load(), "pendingGPU", m.pendingGPU.Load())
+
+	return accept, cpuHold, available, gpu
 }
 
 func (m *Monitor) CanAcceptIngress(info *livekit.IngressInfo) bool {
 	params.UpdateTranscodingEnabled(info)
 
-	accept, _, _ := m.canAcceptIngress(info, false)
+	accept, _, _, _ := m.canAcceptIngress(info, false)
 
 	return accept
 }
 
 func (m *Monitor) AcceptIngress(info *livekit.IngressInfo) bool {
-	accept, cpuHold, available := m.canAcceptIngress(info, true)
+	accept, cpuHold, available, gpu := m.canAcceptIngress(info, true)
 
 	if accept {
 		m.pendingCPUs.Add(cpuHold)
-		time.AfterFunc(time.Second, func() { m.pendingCPUs.Sub(cpuHold) })
+		if gpu {
+			m.pendingGPU.Inc()
+		}
+		time.AfterFunc(time.Second, func() {
+			m.pendingCPUs.Sub(cpuHold)
+			if gpu {
+				m.pendingGPU.Dec()
+			}
+		})
 	}
 
 	logger.Debugw("cpu request", "accepted", accept, "availableCPUs", available, "numCPUs", m.cpuStats.NumCPU())
@@ -415,6 +459,10 @@ func (m *Monitor) AcceptIngress(info *livekit.IngressInfo) bool {
 }
 
 func (m *Monitor) IngressStarted(info *livekit.IngressInfo) {
+	if m.usesGPU(info) {
+		m.gpuSessions.Inc()
+	}
+
 	switch info.InputType {
 	case livekit.IngressInput_RTMP_INPUT:
 		m.requestGauge.With(prometheus.Labels{promLabelType: "rtmp", promLabelTranscoding: fmt.Sprintf("%v", *info.EnableTranscoding)}).Add(1)
@@ -427,6 +475,10 @@ func (m *Monitor) IngressStarted(info *livekit.IngressInfo) {
 }
 
 func (m *Monitor) IngressEnded(info *livekit.IngressInfo) {
+	if m.usesGPU(info) {
+		m.gpuSessions.Dec()
+	}
+
 	switch info.InputType {
 	case livekit.IngressInput_RTMP_INPUT:
 		m.requestGauge.With(prometheus.Labels{promLabelType: "rtmp", promLabelTranscoding: fmt.Sprintf("%v", *info.EnableTranscoding)}).Sub(1)
